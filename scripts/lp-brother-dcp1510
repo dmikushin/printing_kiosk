@@ -1,0 +1,39 @@
+#!/usr/bin/bash
+# lp-brother-dcp1510 - print-wrapper called by the printing_kiosk web app
+# (see simple_print_server/views.py: app.config['PRINT_COMMAND']).
+#
+# Responsibilities:
+#   1) Make sure the Brother DCP-1510 is visible on USB. If not, cycle it
+#      via the brother_dcp1510 helper unit (NOPASSWD-allowed for group
+#      printing_kiosk in /etc/sudoers.d/brother_dcp1510).
+#   2) Route PDFs through /usr/local/bin/brother-safe-print, which splits
+#      memory-heavy jobs into chunks the DCP-1510's tiny RAM can actually
+#      handle. That script is SLOW (per-page cupsfilter measurement +
+#      per-chunk settle delays), so spawn it in the background via the
+#      brother-safe-print-bg helper and return success immediately -- the
+#      kiosk's HTTP handler otherwise blocks the client for minutes.
+#   3) For every other input (txt, png, jpg, jpeg, multi-arg invocations,
+#      stdin pipes), fall through to plain `lp` unchanged. Those are
+#      normally single-page jobs and don't hit the DCP-1510 page-drop bug.
+
+if ! lsusb | grep -q "04f9:02d0"; then
+    sudo /usr/bin/systemctl restart brother_dcp1510.service
+fi
+
+# Single-file PDF: hand off to the background safe-print helper.
+if [ "$#" = 1 ] && [ -f "$1" ]; then
+    ext="${1##*.}"
+    case "${ext,,}" in
+        pdf)
+            # setsid + redirects so the child survives the kiosk's
+            # Popen.wait() and closes the parent's stdout/stderr pipes.
+            setsid /usr/local/bin/brother-safe-print-bg "$1" \
+                </dev/null >/dev/null 2>&1 &
+            echo "lp-brother-dcp1510: queued $1 via brother-safe-print (bg pid $!)"
+            exit 0
+            ;;
+    esac
+fi
+
+# Everything else: pass through to plain lp.
+exec lp "$@"

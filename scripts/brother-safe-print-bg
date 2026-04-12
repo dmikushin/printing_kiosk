@@ -1,0 +1,40 @@
+#!/usr/bin/bash
+# brother-safe-print-bg - serialised background wrapper around
+# /usr/local/bin/brother-safe-print for the printing_kiosk web service.
+#
+# Runs brother-safe-print on the given PDF under a file lock, so
+# concurrent kiosk uploads don't race on the shared CUPS queue (the
+# wait-for-drain logic in brother-safe-print assumes one active job at
+# a time). Logs stdout and stderr to
+# ${BRPRINT_LOGDIR}/<timestamp>-<basename>.log.
+#
+# Usage: brother-safe-print-bg <file.pdf>
+#
+# Intended to be started in a detached background job from
+# /usr/bin/lp-brother-dcp1510 so the kiosk's HTTP handler doesn't block
+# for minutes on the measurement + print phase.
+
+set -u
+
+LOCK="${BRPRINT_LOCK:-/tmp/brother-safe-print.lock}"
+LOGDIR="${BRPRINT_LOGDIR:-/home/printing_kiosk/printing_kiosk/data/brprint-logs}"
+
+if [ "$#" -ne 1 ]; then
+    echo "usage: $0 <file.pdf>" >&2
+    exit 1
+fi
+
+mkdir -p "$LOGDIR" 2>/dev/null || true
+ts="$(date +%Y%m%dT%H%M%S)"
+base="$(basename "$1" .pdf)"
+log="$LOGDIR/${ts}-${base}.log"
+
+(
+    flock -x 9
+    exec >>"$log" 2>&1
+    echo "[$(date -Is)] brother-safe-print-bg start pid=$$ file=$1"
+    /usr/local/bin/brother-safe-print "$1"
+    rc=$?
+    echo "[$(date -Is)] brother-safe-print-bg exit=$rc"
+    exit "$rc"
+) 9>"$LOCK"

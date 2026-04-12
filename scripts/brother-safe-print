@@ -1,0 +1,271 @@
+#!/usr/bin/env bash
+# brother-safe-print - print a PDF to Brother DCP-1510 in memory-safe chunks.
+#
+# The DCP-1510 (and similar cheap brlaser printers) silently drops pages when
+# the host streams brlaser data faster than the firmware can consume it. The
+# brlaser driver is unidirectional so CUPS never notices: jobs are reported
+# "completed" while only a subset of pages physically come out.
+#
+# This wrapper:
+#   1) splits the input PDF into single pages,
+#   2) runs pdftopdf -> gstoraster -> rastertobrlaser on each page to measure
+#      the exact brlaser byte cost of that page (image-heavy pages cost much
+#      more than text pages, so average-based chunking is unreliable),
+#   3) if a page's brlaser output exceeds CHUNK_BYTES at PRIMARY_DPI, remeasures
+#      it at FALLBACK_DPI (downsamples) so it fits; if even FALLBACK_DPI is too
+#      big, aborts with an error,
+#   4) greedily packs pages into chunks whose total brlaser bytes stay under
+#      CHUNK_BYTES, respecting DPI boundaries (a chunk is submitted with one
+#      Resolution value, so consecutive pages with different DPIs cannot share
+#      a chunk),
+#   5) rebuilds each chunk as its own PDF and sends them through `lp` with
+#      `-o Resolution=NNNdpi`, waiting for the CUPS queue to drain AND adding
+#      a mechanical settle delay proportional to the number of pages in the
+#      chunk before submitting the next one.
+#
+# Usage: brother-safe-print [--dry-run] file.pdf
+
+set -euo pipefail
+
+QUEUE="${QUEUE:-Brother_DCP-1510_series}"
+CHUNK_BYTES="${CHUNK_BYTES:-1000000}"  # ~1 MB of brlaser data per chunk (~DCP-1510 RAM)
+SECS_PER_PAGE="${SECS_PER_PAGE:-4}"    # settle delay per page after CUPS drain
+BASE_WAIT="${BASE_WAIT:-3}"            # fixed post-chunk pause
+PRIMARY_DPI="${PRIMARY_DPI:-600}"      # preferred render resolution
+FALLBACK_DPI="${FALLBACK_DPI:-300}"    # fallback used for pages too big at PRIMARY_DPI
+PPD="${PPD:-/etc/cups/ppd/${QUEUE}.ppd}"
+RASTERTOBRL="${RASTERTOBRL:-/usr/lib/cups/filter/rastertobrlaser}"
+DRY_RUN=0
+
+usage() {
+  cat >&2 <<EOF
+Usage: $0 [--dry-run] <file.pdf>
+
+Splits a PDF into the fewest possible chunks such that each chunk's brlaser
+output stays under CHUNK_BYTES, then sends the chunks sequentially to the
+CUPS queue "$QUEUE", waiting between chunks so the printer can finish each
+one before the next starts. Works around silent page drops on memory-poor
+Brother brlaser devices (notably DCP-1510 and family).
+
+Pages whose brlaser output alone exceeds CHUNK_BYTES at PRIMARY_DPI are
+re-rendered at FALLBACK_DPI. Pages still too big at FALLBACK_DPI cause the
+script to abort with an error (exit 5) — at that point the PDF needs to be
+simplified externally (e.g. \`gs -dPDFSETTINGS=/ebook\`) before printing.
+
+Environment overrides:
+  QUEUE           CUPS printer name              (default: Brother_DCP-1510_series)
+  CHUNK_BYTES     Max brlaser bytes per chunk    (default: 1000000 ~1 MB)
+  PRIMARY_DPI     Preferred render resolution    (default: 600)
+  FALLBACK_DPI    Fallback for oversize pages    (default: 300)
+  SECS_PER_PAGE   Settle seconds per page        (default: 4)
+  BASE_WAIT       Fixed post-chunk wait seconds  (default: 3)
+  PPD             Path to PPD                    (default: /etc/cups/ppd/<queue>.ppd)
+  RASTERTOBRL     Path to rastertobrlaser filter (default: /usr/lib/cups/filter/rastertobrlaser)
+
+Flags:
+  --dry-run       Measure and print the chunk plan, do not submit any job.
+
+Exit codes:
+  0  all chunks submitted (or dry-run completed)
+  1  usage / missing input
+  2  bad pdfinfo output
+  3  cupsfilter failure
+  4  rastertobrlaser failure
+  5  a page does not fit CHUNK_BYTES even at FALLBACK_DPI (irreducible)
+EOF
+  exit 1
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1; shift ;;
+    -h|--help) usage ;;
+    --) shift; break ;;
+    -*) echo "unknown flag: $1" >&2; usage ;;
+    *) break ;;
+  esac
+done
+
+[[ $# -eq 1 ]] || usage
+SRC="$(readlink -f "$1")"
+[[ -r "$SRC" ]] || { echo "cannot read: $SRC" >&2; exit 1; }
+[[ -r "$PPD" ]] || { echo "cannot read PPD: $PPD" >&2; exit 1; }
+[[ -x "$RASTERTOBRL" ]] || { echo "missing filter: $RASTERTOBRL" >&2; exit 1; }
+
+for t in pdfinfo pdfseparate pdfunite cupsfilter lp lpstat stat awk; do
+  command -v "$t" >/dev/null || { echo "missing tool: $t" >&2; exit 1; }
+done
+
+WORK="$(mktemp -d -t brprint.XXXXXX)"
+trap 'rm -rf "$WORK"' EXIT
+cd "$WORK"
+
+log() { printf '[brprint] %s\n' "$*"; }
+
+log "source:       $SRC"
+log "queue:        $QUEUE"
+log "ppd:          $PPD"
+log "budget:       $CHUNK_BYTES B brlaser per chunk"
+log "primary dpi:  $PRIMARY_DPI"
+log "fallback dpi: $FALLBACK_DPI"
+(( DRY_RUN )) && log "*** DRY RUN - will not actually print ***"
+
+NPAGES="$(pdfinfo "$SRC" | awk '/^Pages:/ {print $2; exit}')"
+[[ "$NPAGES" =~ ^[0-9]+$ && "$NPAGES" -gt 0 ]] || { echo "bad page count from pdfinfo" >&2; exit 2; }
+log "pages:        $NPAGES"
+
+pdfseparate "$SRC" 'p-%d.pdf'
+
+# Render one page at a given DPI through the full CUPS filter chain up to
+# rastertobrlaser and echo the resulting brlaser file size in bytes. Leaves
+# the intermediate files on disk so the caller can inspect them on failure.
+measure_page() {
+  local i="$1" dpi="$2"
+  local raster="p-$i.${dpi}.raster"
+  local brl="p-$i.${dpi}.brl"
+  local cferr="p-$i.${dpi}.cf.err"
+  local rblerr="p-$i.${dpi}.rbl.err"
+  cupsfilter -p "$PPD" -o "Resolution=${dpi}dpi" -m application/vnd.cups-raster "p-$i.pdf" \
+    > "$raster" 2> "$cferr" || return 3
+  PPD="$PPD" CUPS_SERVERROOT=/etc/cups \
+    "$RASTERTOBRL" 1 brprint "${SRC##*/}" 1 "Resolution=${dpi}dpi" "$raster" \
+      > "$brl" 2> "$rblerr" || return 4
+  rm -f "$raster"
+  stat -c '%s' "$brl"
+}
+
+log "measuring brlaser byte cost per page (Ghostscript + rastertobrlaser per"
+log "  page — slow on a weak SBC; pages that don't fit at ${PRIMARY_DPI}dpi are"
+log "  remeasured at ${FALLBACK_DPI}dpi so this can add extra time)..."
+
+declare -a SIZES DPIS
+total_brl=0
+downgraded=()
+for i in $(seq 1 "$NPAGES"); do
+  if ! s_primary=$(measure_page "$i" "$PRIMARY_DPI"); then
+    rc=$?
+    echo "[brprint] page $i: filter chain failed at ${PRIMARY_DPI}dpi" >&2
+    [[ -s "p-$i.${PRIMARY_DPI}.cf.err" ]]  && sed -n '1,15p' "p-$i.${PRIMARY_DPI}.cf.err"  >&2
+    [[ -s "p-$i.${PRIMARY_DPI}.rbl.err" ]] && sed -n '1,15p' "p-$i.${PRIMARY_DPI}.rbl.err" >&2
+    exit "$rc"
+  fi
+  if (( s_primary <= CHUNK_BYTES )); then
+    SIZES[$i]=$s_primary
+    DPIS[$i]=$PRIMARY_DPI
+    printf '[brprint]   page %2d: %9d B @ %sdpi\n' "$i" "$s_primary" "$PRIMARY_DPI"
+  else
+    # Page too big at primary DPI — try fallback
+    if ! s_fallback=$(measure_page "$i" "$FALLBACK_DPI"); then
+      rc=$?
+      echo "[brprint] page $i: filter chain failed at ${FALLBACK_DPI}dpi" >&2
+      [[ -s "p-$i.${FALLBACK_DPI}.cf.err" ]]  && sed -n '1,15p' "p-$i.${FALLBACK_DPI}.cf.err"  >&2
+      [[ -s "p-$i.${FALLBACK_DPI}.rbl.err" ]] && sed -n '1,15p' "p-$i.${FALLBACK_DPI}.rbl.err" >&2
+      exit "$rc"
+    fi
+    if (( s_fallback > CHUNK_BYTES )); then
+      log "ERROR: page $i does not fit in CHUNK_BYTES=$CHUNK_BYTES even at ${FALLBACK_DPI}dpi:"
+      log "  @ ${PRIMARY_DPI}dpi : $s_primary B"
+      log "  @ ${FALLBACK_DPI}dpi: $s_fallback B"
+      log "  This page is irreducible within the current budget. Options:"
+      log "    - raise CHUNK_BYTES (current: $CHUNK_BYTES) if you trust the printer with more,"
+      log "    - pre-simplify the PDF externally, e.g.:"
+      log "        gs -sDEVICE=pdfwrite -dPDFSETTINGS=/ebook -dNOPAUSE -dBATCH -dQUIET \\"
+      log "           -sOutputFile=simplified.pdf \"$SRC\""
+      log "    - or lower FALLBACK_DPI further if your PPD supports it (check \`lpoptions -l\`)."
+      exit 5
+    fi
+    SIZES[$i]=$s_fallback
+    DPIS[$i]=$FALLBACK_DPI
+    downgraded+=("$i")
+    printf '[brprint]   page %2d: %9d B @ %sdpi > %d budget → downgraded to %9d B @ %sdpi\n' \
+      "$i" "$s_primary" "$PRIMARY_DPI" "$CHUNK_BYTES" "$s_fallback" "$FALLBACK_DPI"
+  fi
+  total_brl=$((total_brl + SIZES[$i]))
+done
+
+# Drop the large intermediates — keep per-page PDFs for the assembly step.
+rm -f p-*.brl p-*.cf.err p-*.rbl.err p-*.raster
+
+log "total:        $total_brl B brlaser for $NPAGES pages (avg $((total_brl / NPAGES)) B/page)"
+if (( ${#downgraded[@]} > 0 )); then
+  log "downgraded:   ${#downgraded[@]} page(s) remeasured at ${FALLBACK_DPI}dpi: ${downgraded[*]}"
+fi
+
+# Greedy chunk packing — chunks must have homogeneous DPI, because lp applies
+# the -o Resolution option to the whole job.
+declare -a first last chunk_dpis
+first=(1)
+last=()
+chunk_dpis=("${DPIS[1]}")
+cur=${SIZES[1]}
+
+for i in $(seq 2 "$NPAGES"); do
+  s=${SIZES[$i]}
+  page_dpi=${DPIS[$i]}
+  prev_dpi=${chunk_dpis[$((${#chunk_dpis[@]}-1))]}
+  if (( cur + s > CHUNK_BYTES )) || [[ "$page_dpi" != "$prev_dpi" ]]; then
+    last+=($((i-1)))
+    first+=("$i")
+    chunk_dpis+=("$page_dpi")
+    cur=$s
+  else
+    cur=$((cur + s))
+  fi
+done
+last+=("$NPAGES")
+
+N=${#first[@]}
+log "plan:         $N chunks"
+for i in $(seq 0 $((N-1))); do
+  a=${first[$i]}; b=${last[$i]}
+  d=${chunk_dpis[$i]}
+  sum=0
+  for j in $(seq "$a" "$b"); do sum=$((sum + SIZES[$j])); done
+  printf '[brprint]   chunk %2d: pages %2d..%-2d  %9d B  (%d pp @ %sdpi)\n' \
+    "$((i+1))" "$a" "$b" "$sum" "$((b-a+1))" "$d"
+done
+
+if (( DRY_RUN )); then
+  log "dry run complete — not submitting any jobs"
+  exit 0
+fi
+
+wait_cups_drained() {
+  local t=0
+  while lpstat -W not-completed -o "$QUEUE" 2>/dev/null | grep -q .; do
+    sleep 1
+    t=$((t+1))
+    if (( t > 600 )); then
+      echo "[brprint] drain timeout (>600s) on queue $QUEUE" >&2
+      return 1
+    fi
+  done
+  return 0
+}
+
+BASENAME="${SRC##*/}"
+BASENAME="${BASENAME%.pdf}"
+
+for i in $(seq 0 $((N-1))); do
+  a=${first[$i]}; b=${last[$i]}
+  d=${chunk_dpis[$i]}
+  out="chunk-$((i+1))-p${a}-${b}-${d}dpi.pdf"
+  if [[ "$a" == "$b" ]]; then
+    cp "p-$a.pdf" "$out"
+  else
+    files=()
+    for j in $(seq "$a" "$b"); do files+=("p-$j.pdf"); done
+    pdfunite "${files[@]}" "$out"
+  fi
+  npp=$((b - a + 1))
+  title="${BASENAME} pp${a}-${b} @${d}dpi"
+  log "chunk $((i+1))/$N: submitting pages $a..$b at ${d}dpi as '$title'"
+  lp -d "$QUEUE" -t "$title" -o "Resolution=${d}dpi" "$out" >/dev/null
+  log "  waiting for CUPS queue to drain..."
+  wait_cups_drained || true
+  settle=$((npp * SECS_PER_PAGE + BASE_WAIT))
+  log "  mechanical settle: ${settle}s (${npp}pp × ${SECS_PER_PAGE}s + ${BASE_WAIT}s)"
+  sleep "$settle"
+done
+
+log "done: $N chunks sent to $QUEUE"

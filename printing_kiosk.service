@@ -1,13 +1,11 @@
 [Unit]
 Description=Printing Kiosk Service
-After=syslog.target network.target docker.service
-BindsTo=docker.service
-ReloadPropagatedFrom=docker.service
+After=syslog.target network.target
 
 [Service]
 Type=simple
 User=printing_kiosk
-ExecStart=/home/printing_kiosk/printing_kiosk/venv/bin/python /home/printing_kiosk/printing_kiosk/run.py 172.17.0.1
+ExecStart=/home/printing_kiosk/printing_kiosk/venv/bin/python /home/printing_kiosk/printing_kiosk/run.py 127.0.0.1
 WorkingDirectory=/home/printing_kiosk/printing_kiosk
 Restart=on-abort
 

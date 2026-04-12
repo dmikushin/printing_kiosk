@@ -21,15 +21,15 @@ class PrintedFile(Base):
     id = Column(Integer, primary_key=True)
     filename = Column(String(120), unique=False)
     uuid = Column(String(40), unique=True)
-    time_printed = Column(String(40), unique=False) # Time string
+    time_printed = Column(String(40), unique=False)  # Time string
+    pages = Column(String(120), unique=False, nullable=True)  # e.g. "1-3, 5, 8-18"; NULL = all
 #    user = None #TODO
 
-    def __init__(self, filename=None, uuid=None):
+    def __init__(self, filename=None, uuid=None, pages=None):
         self.filename = filename
         self.uuid = uuid
+        self.pages = pages
         self.time_printed = time.strftime("%b %d %Y %H:%M:%S")
 
     def __repr__(self):
         return '<PrintedFile %r>' % (self.uuid)
-
-
