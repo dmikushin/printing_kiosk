@@ -1,0 +1,105 @@
+{% extends "layout.html" %}
+{% block body %}
+<section class="card">
+    <h1 class="card-title">Scan a document</h1>
+    <p class="card-sub">Brother DCP-1510 · Flatbed</p>
+
+    <form action="/scan" method="post" class="scan-form" id="scan-form">
+        <div class="scan-grid">
+            <div class="field">
+                <label for="resolution">Resolution</label>
+                <select id="resolution" name="resolution" class="select-field">
+                    <option value="100">100 dpi (fast)</option>
+                    <option value="200" selected>200 dpi</option>
+                    <option value="300">300 dpi</option>
+                    <option value="600">600 dpi (slow)</option>
+                </select>
+            </div>
+
+            <div class="field">
+                <label for="mode">Mode</label>
+                <select id="mode" name="mode" class="select-field">
+                    <option value="True Gray" selected>Grayscale</option>
+                    <option value="Black & White">Black & White</option>
+                </select>
+            </div>
+
+            <div class="field">
+                <label for="format">Format</label>
+                <select id="format" name="format" class="select-field">
+                    <option value="png" selected>PNG</option>
+                    <option value="jpeg">JPEG</option>
+                    <option value="pnm">PNM (raw)</option>
+                </select>
+            </div>
+
+            <div class="field">
+                <label for="area">Paper size</label>
+                <select id="area" name="area" class="select-field">
+                    <option value="a4" selected>A4 (210 x 297 mm)</option>
+                    <option value="letter">Letter (216 x 279 mm)</option>
+                    <option value="custom">Custom</option>
+                </select>
+            </div>
+        </div>
+
+        <div class="scan-custom-area" id="custom-area" hidden>
+            <div class="scan-grid">
+                <div class="field">
+                    <label for="width">Width (mm)</label>
+                    <input type="number" id="width" name="width" value="210" min="10" max="216"
+                           class="select-field">
+                </div>
+                <div class="field">
+                    <label for="height">Height (mm)</label>
+                    <input type="number" id="height" name="height" value="297" min="10" max="297"
+                           class="select-field">
+                </div>
+            </div>
+        </div>
+
+        <button type="submit" class="btn-scan" id="scanBtn">Scan</button>
+    </form>
+</section>
+
+<section class="card">
+    <h2 class="card-title">Recent scans</h2>
+    {% if recent and recent|length > 0 %}
+    <table class="recent">
+        <thead>
+            <tr>
+                <th>Filename</th>
+                <th>Size</th>
+                <th>Scanned</th>
+                <th></th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for scan in recent %}
+            <tr>
+                <td class="cell-filename">{{ scan.filename }}</td>
+                <td class="cell-pages">{{ scan.size }}</td>
+                <td class="cell-time">{{ scan.time }}</td>
+                <td><a href="/scan/download/{{ scan.filename }}" class="btn-download">Download</a></td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p class="muted">No recent scans yet.</p>
+    {% endif %}
+</section>
+
+<script>
+(function() {
+    document.getElementById('area').addEventListener('change', function() {
+        document.getElementById('custom-area').hidden = this.value !== 'custom';
+    });
+    document.getElementById('scan-form').addEventListener('submit', function() {
+        var btn = document.getElementById('scanBtn');
+        btn.disabled = true;
+        btn.textContent = 'Scanning\u2026 please wait';
+    });
+})();
+</script>
+{% endblock %}

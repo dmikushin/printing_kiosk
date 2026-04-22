@@ -11,10 +11,18 @@
     <header class="topbar">
         <div class="topbar-inner">
             <a class="brand" href="{{ url_for('main_page') }}">
-                <span class="brand-mark">⎙</span>
-                <span class="brand-name">Print Kiosk</span>
+                <span class="brand-mark">{% if request.path == '/scan' %}🔍{% else %}⎙{% endif %}</span>
+                <span class="brand-name">{% if request.path == '/scan' %}Scan Kiosk{% else %}Print Kiosk{% endif %}</span>
             </a>
-            <span class="brand-sub">Brother DCP-1510 · A4</span>
+            <nav class="mode-nav">
+                <a href="/" class="mode-link {% if request.path != '/scan' %}active{% endif %}">Printer</a>
+                <label class="mode-toggle">
+                    <input type="checkbox" {% if request.path == '/scan' %}checked{% endif %}
+                           onchange="window.location = this.checked ? '/scan' : '/'">
+                    <span class="mode-track"><span class="mode-thumb"></span></span>
+                </label>
+                <a href="/scan" class="mode-link {% if request.path == '/scan' %}active{% endif %}">Scanner</a>
+            </nav>
         </div>
     </header>
 

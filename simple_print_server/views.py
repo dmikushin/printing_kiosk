@@ -3,9 +3,10 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import datetime
 import uuid
-from flask import Flask, request, redirect, url_for, render_template, flash
+from flask import Flask, request, redirect, url_for, render_template, flash, send_file
 from werkzeug.utils import secure_filename
 
 from simple_print_server.database import db_session
@@ -232,3 +233,132 @@ def upload_file():
 def main_page():
     recent_files = list(PrintedFile.query.order_by(PrintedFile.id.desc()).limit(10))
     return render_template('index.html', recent=recent_files)
+
+
+# --- Scanner ---
+
+SCAN_FOLDER = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           'data', 'scans')
+
+
+def get_scan_area(form):
+    area = form.get('area', 'a4')
+    if area == 'letter':
+        return 216, 279
+    elif area == 'custom':
+        return int(form.get('width', 210)), int(form.get('height', 297))
+    return 210, 297
+
+
+def get_recent_scans(limit=10):
+    if not os.path.exists(SCAN_FOLDER):
+        return []
+    files = []
+    for fn in sorted(os.listdir(SCAN_FOLDER), reverse=True):
+        fpath = os.path.join(SCAN_FOLDER, fn)
+        if not os.path.isfile(fpath):
+            continue
+        size = os.path.getsize(fpath)
+        if size > 1024 * 1024:
+            size_str = '{:.1f} MB'.format(size / (1024 * 1024))
+        elif size > 1024:
+            size_str = '{:.0f} KB'.format(size / 1024)
+        else:
+            size_str = '{} B'.format(size)
+        mtime = datetime.datetime.fromtimestamp(os.path.getmtime(fpath))
+        files.append({
+            'filename': fn,
+            'size': size_str,
+            'time': mtime.strftime('%b %d %Y %H:%M:%S'),
+        })
+        if len(files) >= limit:
+            break
+    return files
+
+
+@app.route('/scan', methods=['GET'])
+def scanner_page():
+    return render_template('scanner.html', recent=get_recent_scans())
+
+
+@app.route('/scan', methods=['POST'])
+def do_scan():
+    if not os.path.exists(SCAN_FOLDER):
+        os.makedirs(SCAN_FOLDER)
+
+    resolution = request.form.get('resolution', '200')
+    mode = request.form.get('mode', 'True Gray')
+    fmt = request.form.get('format', 'png')
+    width_mm, height_mm = get_scan_area(request.form)
+
+    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    outfile = 'scan_{}_{}.{}'.format(timestamp, resolution, fmt)
+    outpath = os.path.join(SCAN_FOLDER, outfile)
+
+    # Power cycle to clear stale USB sessions
+    try:
+        subprocess.call(['sudo', 'systemctl', 'restart', 'brother_dcp1510.service'],
+                        timeout=10)
+        time.sleep(15)
+    except Exception:
+        pass
+
+    scan_cmd = [
+        'sudo', 'scanimage',
+        '--mode', mode,
+        '--resolution', resolution,
+        '-x', str(width_mm),
+        '-y', str(height_mm),
+        '--format', 'pnm',
+    ]
+
+    logger.info('Scanning: %s', ' '.join(scan_cmd))
+
+    try:
+        timeout_sec = 60 + int(resolution) * int(height_mm) // 100
+        result = subprocess.run(scan_cmd, capture_output=True, timeout=timeout_sec)
+        pnm_data = result.stdout
+
+        if len(pnm_data) == 0:
+            flash('Scan failed: no data received', 'danger')
+            return redirect(url_for('scanner_page'))
+
+        if fmt == 'pnm':
+            with open(outpath, 'wb') as f:
+                f.write(pnm_data)
+        else:
+            try:
+                from PIL import Image
+                import io
+                img = Image.open(io.BytesIO(pnm_data))
+                if fmt == 'jpeg':
+                    img.save(outpath, 'JPEG', quality=90)
+                else:
+                    img.save(outpath, 'PNG')
+            except ImportError:
+                outfile = outfile.rsplit('.', 1)[0] + '.pnm'
+                outpath = os.path.join(SCAN_FOLDER, outfile)
+                with open(outpath, 'wb') as f:
+                    f.write(pnm_data)
+                flash('Saved as PNM (install Pillow for PNG/JPEG)', 'info')
+                return redirect(url_for('scanner_page'))
+
+        flash('Scan complete: {}'.format(outfile), 'success')
+        logger.info('Scan saved: %s', outpath)
+
+    except subprocess.TimeoutExpired:
+        flash('Scan timed out', 'danger')
+    except Exception as e:
+        flash('Scan error: {}'.format(e), 'danger')
+        logger.error('Scan error: %s', e)
+
+    return redirect(url_for('scanner_page'))
+
+
+@app.route('/scan/download/<filename>')
+def download_scan(filename):
+    filepath = os.path.join(SCAN_FOLDER, secure_filename(filename))
+    if not os.path.exists(filepath):
+        flash('File not found', 'danger')
+        return redirect(url_for('scanner_page'))
+    return send_file(filepath, as_attachment=True)
