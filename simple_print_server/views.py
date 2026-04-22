@@ -300,12 +300,16 @@ def do_scan():
     import tempfile
     pnm_tmp = tempfile.mktemp(suffix='.pnm', dir=SCAN_FOLDER)
 
-    # Estimate scan time: ~5s base + proportional to area and resolution
-    scan_seconds = 5 + int(resolution) * int(height_mm) // 2000 * 3
-    if scan_seconds < 15:
-        scan_seconds = 15
-    # Add generous padding for the scanner to finish
-    kill_after = scan_seconds + 30
+    # Estimate scan time: physical scan + data transfer + EOF wait
+    # Color mode takes ~3x longer. Higher resolution = more data.
+    color_factor = 3 if 'Color' in mode or 'color' in mode else 1
+    reso = int(resolution)
+    h = int(height_mm)
+    # Physical scan: ~1 second per 30mm at 200dpi, proportional to resolution
+    physical_time = max(h * reso // 6000, 5)
+    # EOF wait: scanimage hangs waiting for EOF (~20-30s typically)
+    eof_wait = 30
+    kill_after = (physical_time * color_factor) + eof_wait
 
     scan_cmd = [
         'timeout', str(kill_after),
