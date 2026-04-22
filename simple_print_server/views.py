@@ -295,7 +295,20 @@ def do_scan():
     outfile = 'scan_{}_{}.{}'.format(timestamp, resolution, fmt)
     outpath = os.path.join(SCAN_FOLDER, outfile)
 
+    # scanimage doesn't exit cleanly (no EOF from scanner), so use
+    # a temp file + timeout to capture whatever data is produced.
+    import tempfile
+    pnm_tmp = tempfile.mktemp(suffix='.pnm', dir=SCAN_FOLDER)
+
+    # Estimate scan time: ~5s base + proportional to area and resolution
+    scan_seconds = 5 + int(resolution) * int(height_mm) // 2000 * 3
+    if scan_seconds < 15:
+        scan_seconds = 15
+    # Add generous padding for the scanner to finish
+    kill_after = scan_seconds + 30
+
     scan_cmd = [
+        'timeout', str(kill_after),
         '/usr/bin/scanimage',
         '--mode', mode,
         '--resolution', resolution,
@@ -304,23 +317,33 @@ def do_scan():
         '--format', 'pnm',
     ]
 
-    logger.info('Scanning: %s', ' '.join(scan_cmd))
+    logger.info('Scanning: %s (kill after %ds)', ' '.join(scan_cmd), kill_after)
 
     try:
-        timeout_sec = 60 + int(resolution) * int(height_mm) // 100
-        result = subprocess.run(scan_cmd, capture_output=True, timeout=timeout_sec)
-        pnm_data = result.stdout
+        with open(pnm_tmp, 'wb') as pnm_file:
+            result = subprocess.run(scan_cmd, stdout=pnm_file,
+                                    stderr=subprocess.PIPE,
+                                    timeout=kill_after + 10)
 
-        if result.returncode != 0 or len(pnm_data) == 0:
-            stderr_msg = result.stderr.decode('utf-8', errors='replace').strip()
-            logger.error('scanimage failed (exit %d): %s', result.returncode, stderr_msg)
+        pnm_size = os.path.getsize(pnm_tmp) if os.path.exists(pnm_tmp) else 0
 
-        if len(pnm_data) == 0:
-            stderr_text = result.stderr.decode('utf-8', errors='replace').strip() if result.stderr else ''
+        if result.returncode != 0 and pnm_size > 0:
+            logger.info('scanimage exited %d but produced %d bytes (timeout expected)',
+                        result.returncode, pnm_size)
+        elif pnm_size == 0:
+            stderr_text = result.stderr.decode('utf-8', errors='replace').strip()
+            logger.error('scanimage failed (exit %d): %s', result.returncode, stderr_text)
             if 'Invalid argument' in stderr_text or 'failed' in stderr_text:
                 flash('Scanner busy or not ready. Try power cycling the printer.', 'danger')
             else:
                 flash('Scan failed: no data received', 'danger')
+            os.unlink(pnm_tmp)
+            return redirect(url_for('scanner_page'))
+
+        # Read the PNM data
+        with open(pnm_tmp, 'rb') as f:
+            pnm_data = f.read()
+        os.unlink(pnm_tmp)
             return redirect(url_for('scanner_page'))
 
         if fmt == 'pnm':
