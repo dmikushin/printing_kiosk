@@ -295,13 +295,22 @@ def do_scan():
     outfile = 'scan_{}_{}.{}'.format(timestamp, resolution, fmt)
     outpath = os.path.join(SCAN_FOLDER, outfile)
 
-    # Power cycle to clear stale USB sessions
+    # Check if scanner is available; power cycle only if needed
     try:
-        subprocess.call(['sudo', 'systemctl', 'restart', 'brother_dcp1510.service'],
-                        timeout=10)
-        time.sleep(15)
+        probe = subprocess.run(['/usr/bin/scanimage', '-L'],
+                               capture_output=True, timeout=10)
+        scanner_found = b'brother' in probe.stdout.lower()
     except Exception:
-        pass
+        scanner_found = False
+
+    if not scanner_found:
+        logger.info('Scanner not found, power cycling...')
+        try:
+            subprocess.call(['sudo', 'systemctl', 'restart', 'brother_dcp1510.service'],
+                            timeout=10)
+            time.sleep(15)
+        except Exception:
+            pass
 
     scan_cmd = [
         '/usr/bin/scanimage',
@@ -318,6 +327,10 @@ def do_scan():
         timeout_sec = 60 + int(resolution) * int(height_mm) // 100
         result = subprocess.run(scan_cmd, capture_output=True, timeout=timeout_sec)
         pnm_data = result.stdout
+
+        if result.returncode != 0 or len(pnm_data) == 0:
+            stderr_msg = result.stderr.decode('utf-8', errors='replace').strip()
+            logger.error('scanimage failed (exit %d): %s', result.returncode, stderr_msg)
 
         if len(pnm_data) == 0:
             flash('Scan failed: no data received', 'danger')
