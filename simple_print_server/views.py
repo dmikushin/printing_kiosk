@@ -344,7 +344,6 @@ def do_scan():
         with open(pnm_tmp, 'rb') as f:
             pnm_data = f.read()
         os.unlink(pnm_tmp)
-            return redirect(url_for('scanner_page'))
 
         if fmt == 'pnm':
             with open(outpath, 'wb') as f:
