@@ -304,7 +304,7 @@ def do_scan():
         pass
 
     scan_cmd = [
-        'sudo', 'scanimage',
+        '/usr/bin/scanimage',
         '--mode', mode,
         '--resolution', resolution,
         '-x', str(width_mm),
