@@ -295,23 +295,6 @@ def do_scan():
     outfile = 'scan_{}_{}.{}'.format(timestamp, resolution, fmt)
     outpath = os.path.join(SCAN_FOLDER, outfile)
 
-    # Check if scanner is available; power cycle only if needed
-    try:
-        probe = subprocess.run(['/usr/bin/scanimage', '-L'],
-                               capture_output=True, timeout=10)
-        scanner_found = b'brother' in probe.stdout.lower()
-    except Exception:
-        scanner_found = False
-
-    if not scanner_found:
-        logger.info('Scanner not found, power cycling...')
-        try:
-            subprocess.call(['sudo', 'systemctl', 'restart', 'brother_dcp1510.service'],
-                            timeout=10)
-            time.sleep(15)
-        except Exception:
-            pass
-
     scan_cmd = [
         '/usr/bin/scanimage',
         '--mode', mode,
@@ -333,7 +316,11 @@ def do_scan():
             logger.error('scanimage failed (exit %d): %s', result.returncode, stderr_msg)
 
         if len(pnm_data) == 0:
-            flash('Scan failed: no data received', 'danger')
+            stderr_text = result.stderr.decode('utf-8', errors='replace').strip() if result.stderr else ''
+            if 'Invalid argument' in stderr_text or 'failed' in stderr_text:
+                flash('Scanner busy or not ready. Try power cycling the printer.', 'danger')
+            else:
+                flash('Scan failed: no data received', 'danger')
             return redirect(url_for('scanner_page'))
 
         if fmt == 'pnm':
