@@ -90,4 +90,5 @@ ENV/
 
 # local uploads
 uploads/
+data/
 .DS_store

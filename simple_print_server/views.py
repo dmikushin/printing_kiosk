@@ -283,137 +283,114 @@ def scanner_page():
 
 
 def ensure_scanner_powered():
-    """Mirror /usr/bin/lp-brother-dcp1510 auto-power-on: if the DCP-1510
-    USB VID:PID 04f9:02d0 is not currently enumerated, cycle it via the
-    brother_dcp1510 systemd helper (NOPASSWD-allowed in sudoers) and
-    wait for kernel re-enumeration."""
-    try:
-        lsusb = subprocess.run(["lsusb"], capture_output=True, text=True, timeout=5)
-        if "04f9:02d0" in lsusb.stdout:
-            return True
-    except Exception as e:
-        logger.warning("ensure_scanner_powered: lsusb failed: %s", e)
-    logger.info("Scanner not on USB bus, power-cycling via brother_dcp1510.service")
-    try:
-        subprocess.run(["sudo", "/usr/bin/systemctl", "restart",
-                        "brother_dcp1510.service"],
-                       check=True, timeout=20)
-    except Exception as e:
-        logger.error("ensure_scanner_powered: restart failed: %s", e)
-        return False
-    for _ in range(30):
-        time.sleep(0.5)
-        try:
-            lsusb = subprocess.run(["lsusb"], capture_output=True, text=True, timeout=5)
-            if "04f9:02d0" in lsusb.stdout:
-                time.sleep(1.0)
-                return True
-        except Exception:
-            pass
-    logger.error("ensure_scanner_powered: scanner did not appear after power cycle")
-    return False
+    """Deprecated: power-on is now handled by the remote kiosk API
+    (printing-kiosk-api) in its /scan pipeline. Kept as a no-op so
+    existing call sites continue to work while we rip the old logic out."""
+    return True
 
 
 @app.route('/scan', methods=['POST'])
 def do_scan():
-    if not ensure_scanner_powered():
-        flash('Scanner could not be powered on. Check the printer and relay.', 'danger')
-        return redirect(url_for('scanner_page'))
+    import json as _json
+    from urllib import request as _urlreq, error as _urlerr
+
     if not os.path.exists(SCAN_FOLDER):
         os.makedirs(SCAN_FOLDER)
+
+    api_url = app.config.get('KIOSK_API_URL') or os.environ.get(
+        'KIOSK_API_URL', 'http://127.0.0.1:8080')
 
     resolution = request.form.get('resolution', '200')
     mode = request.form.get('mode', 'True Gray')
     fmt = request.form.get('format', 'png')
     width_mm, height_mm = get_scan_area(request.form)
 
+    payload = {
+        'mode': mode,
+        'resolution': int(resolution),
+        'tlx_mm': 0.0,
+        'tly_mm': 0.0,
+        'brx_mm': float(width_mm),
+        'bry_mm': float(height_mm),
+    }
+
+    try:
+        req = _urlreq.Request(
+            api_url + '/scan',
+            data=_json.dumps(payload).encode('utf-8'),
+            headers={'Content-Type': 'application/json'},
+            method='POST',
+        )
+        with _urlreq.urlopen(req, timeout=30) as r:
+            start = _json.loads(r.read().decode('utf-8'))
+    except _urlerr.HTTPError as e:
+        body = e.read().decode('utf-8', errors='replace') if hasattr(e, 'read') else str(e)
+        logger.error('API /scan POST failed (%d): %s', e.code, body)
+        flash('Scan failed: API returned {}'.format(e.code), 'danger')
+        return redirect(url_for('scanner_page'))
+    except Exception as e:
+        logger.error('API /scan POST error: %s', e)
+        flash('Scan failed: cannot reach kiosk API ({})'.format(e), 'danger')
+        return redirect(url_for('scanner_page'))
+
+    scan_id = start['id']
+    logger.info('Scan started, id=%s', scan_id)
+
+    # Poll status until done/error. Max wait ~10 minutes.
+    for _ in range(1200):  # 1200 * 0.5s = 10 min
+        time.sleep(0.5)
+        try:
+            with _urlreq.urlopen(api_url + '/scan/' + scan_id, timeout=10) as r:
+                st = _json.loads(r.read().decode('utf-8'))
+        except Exception as e:
+            logger.warning('status poll error: %s', e)
+            continue
+        state = st.get('state')
+        if state == 'done':
+            break
+        if state in ('error', 'cancelled'):
+            err = st.get('error') or 'unknown error'
+            logger.error('Scan failed: %s', err)
+            flash('Scan failed: {}'.format(err), 'danger')
+            return redirect(url_for('scanner_page'))
+    else:
+        flash('Scan timed out', 'danger')
+        return redirect(url_for('scanner_page'))
+
     timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
     outfile = 'scan_{}_{}.{}'.format(timestamp, resolution, fmt)
     outpath = os.path.join(SCAN_FOLDER, outfile)
 
-    # scanimage doesn't exit cleanly (no EOF from scanner), so use
-    # a temp file + timeout to capture whatever data is produced.
-    import tempfile
-    pnm_tmp = tempfile.mktemp(suffix='.pnm', dir=SCAN_FOLDER)
-
-    # Estimate scan time: physical scan + data transfer + EOF wait
-    # Color mode takes ~3x longer. Higher resolution = more data.
-    color_factor = 3 if 'Color' in mode or 'color' in mode else 1
-    reso = int(resolution)
-    h = int(height_mm)
-    # Physical scan: ~1 second per 30mm at 200dpi, proportional to resolution
-    physical_time = max(h * reso // 6000, 5)
-    # EOF wait: scanimage hangs waiting for EOF (~20-30s typically)
-    eof_wait = 30
-    kill_after = (physical_time * color_factor) + eof_wait
-
-    scan_cmd = [
-        'timeout', str(kill_after),
-        '/usr/bin/scanimage',
-        '--mode', mode,
-        '--resolution', resolution,
-        '-x', str(width_mm),
-        '-y', str(height_mm),
-        '--format', 'pnm',
-    ]
-
-    logger.info('Scanning: %s (kill after %ds)', ' '.join(scan_cmd), kill_after)
-
     try:
-        with open(pnm_tmp, 'wb') as pnm_file:
-            result = subprocess.run(scan_cmd, stdout=pnm_file,
-                                    stderr=subprocess.PIPE,
-                                    timeout=kill_after + 10)
+        with _urlreq.urlopen(api_url + '/scan/' + scan_id + '/result', timeout=120) as r:
+            pnm_data = r.read()
+    except Exception as e:
+        logger.error('result download error: %s', e)
+        flash('Scan finished but result download failed: {}'.format(e), 'danger')
+        return redirect(url_for('scanner_page'))
 
-        pnm_size = os.path.getsize(pnm_tmp) if os.path.exists(pnm_tmp) else 0
-
-        if result.returncode != 0 and pnm_size > 0:
-            logger.info('scanimage exited %d but produced %d bytes (timeout expected)',
-                        result.returncode, pnm_size)
-        elif pnm_size == 0:
-            stderr_text = result.stderr.decode('utf-8', errors='replace').strip()
-            logger.error('scanimage failed (exit %d): %s', result.returncode, stderr_text)
-            if 'Invalid argument' in stderr_text or 'failed' in stderr_text:
-                flash('Scanner busy or not ready. Try power cycling the printer.', 'danger')
+    if fmt == 'pnm':
+        with open(outpath, 'wb') as f:
+            f.write(pnm_data)
+    else:
+        try:
+            from PIL import Image
+            import io
+            img = Image.open(io.BytesIO(pnm_data))
+            if fmt == 'jpeg':
+                img.save(outpath, 'JPEG', quality=90)
             else:
-                flash('Scan failed: no data received', 'danger')
-            os.unlink(pnm_tmp)
-            return redirect(url_for('scanner_page'))
-
-        # Read the PNM data
-        with open(pnm_tmp, 'rb') as f:
-            pnm_data = f.read()
-        os.unlink(pnm_tmp)
-
-        if fmt == 'pnm':
+                img.save(outpath, 'PNG')
+        except ImportError:
+            outfile = outfile.rsplit('.', 1)[0] + '.pnm'
+            outpath = os.path.join(SCAN_FOLDER, outfile)
             with open(outpath, 'wb') as f:
                 f.write(pnm_data)
-        else:
-            try:
-                from PIL import Image
-                import io
-                img = Image.open(io.BytesIO(pnm_data))
-                if fmt == 'jpeg':
-                    img.save(outpath, 'JPEG', quality=90)
-                else:
-                    img.save(outpath, 'PNG')
-            except ImportError:
-                outfile = outfile.rsplit('.', 1)[0] + '.pnm'
-                outpath = os.path.join(SCAN_FOLDER, outfile)
-                with open(outpath, 'wb') as f:
-                    f.write(pnm_data)
-                flash('Saved as PNM (install Pillow for PNG/JPEG)', 'info')
-                return redirect(url_for('scanner_page'))
+            flash('Saved as PNM (install Pillow for PNG/JPEG)', 'info')
+            return redirect(url_for('scanner_page'))
 
-        flash('Scan complete: {}'.format(outfile), 'success')
-        logger.info('Scan saved: %s', outpath)
-
-    except subprocess.TimeoutExpired:
-        flash('Scan timed out', 'danger')
-    except Exception as e:
-        flash('Scan error: {}'.format(e), 'danger')
-        logger.error('Scan error: %s', e)
-
+    flash('Scan complete: {}'.format(outfile), 'success')
+    logger.info('Scan saved: %s', outpath)
     return redirect(url_for('scanner_page'))
 
 
