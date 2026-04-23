@@ -281,8 +281,44 @@ def scanner_page():
     return render_template('scanner.html', recent=get_recent_scans())
 
 
+
+def ensure_scanner_powered():
+    """Mirror /usr/bin/lp-brother-dcp1510 auto-power-on: if the DCP-1510
+    USB VID:PID 04f9:02d0 is not currently enumerated, cycle it via the
+    brother_dcp1510 systemd helper (NOPASSWD-allowed in sudoers) and
+    wait for kernel re-enumeration."""
+    try:
+        lsusb = subprocess.run(["lsusb"], capture_output=True, text=True, timeout=5)
+        if "04f9:02d0" in lsusb.stdout:
+            return True
+    except Exception as e:
+        logger.warning("ensure_scanner_powered: lsusb failed: %s", e)
+    logger.info("Scanner not on USB bus, power-cycling via brother_dcp1510.service")
+    try:
+        subprocess.run(["sudo", "/usr/bin/systemctl", "restart",
+                        "brother_dcp1510.service"],
+                       check=True, timeout=20)
+    except Exception as e:
+        logger.error("ensure_scanner_powered: restart failed: %s", e)
+        return False
+    for _ in range(30):
+        time.sleep(0.5)
+        try:
+            lsusb = subprocess.run(["lsusb"], capture_output=True, text=True, timeout=5)
+            if "04f9:02d0" in lsusb.stdout:
+                time.sleep(1.0)
+                return True
+        except Exception:
+            pass
+    logger.error("ensure_scanner_powered: scanner did not appear after power cycle")
+    return False
+
+
 @app.route('/scan', methods=['POST'])
 def do_scan():
+    if not ensure_scanner_powered():
+        flash('Scanner could not be powered on. Check the printer and relay.', 'danger')
+        return redirect(url_for('scanner_page'))
     if not os.path.exists(SCAN_FOLDER):
         os.makedirs(SCAN_FOLDER)
 
