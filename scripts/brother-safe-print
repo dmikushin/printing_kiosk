@@ -1,271 +1,355 @@
-#!/usr/bin/env bash
-# brother-safe-print - print a PDF to Brother DCP-1510 in memory-safe chunks.
-#
-# The DCP-1510 (and similar cheap brlaser printers) silently drops pages when
-# the host streams brlaser data faster than the firmware can consume it. The
-# brlaser driver is unidirectional so CUPS never notices: jobs are reported
-# "completed" while only a subset of pages physically come out.
-#
-# This wrapper:
-#   1) splits the input PDF into single pages,
-#   2) runs pdftopdf -> gstoraster -> rastertobrlaser on each page to measure
-#      the exact brlaser byte cost of that page (image-heavy pages cost much
-#      more than text pages, so average-based chunking is unreliable),
-#   3) if a page's brlaser output exceeds CHUNK_BYTES at PRIMARY_DPI, remeasures
-#      it at FALLBACK_DPI (downsamples) so it fits; if even FALLBACK_DPI is too
-#      big, aborts with an error,
-#   4) greedily packs pages into chunks whose total brlaser bytes stay under
-#      CHUNK_BYTES, respecting DPI boundaries (a chunk is submitted with one
-#      Resolution value, so consecutive pages with different DPIs cannot share
-#      a chunk),
-#   5) rebuilds each chunk as its own PDF and sends them through `lp` with
-#      `-o Resolution=NNNdpi`, waiting for the CUPS queue to drain AND adding
-#      a mechanical settle delay proportional to the number of pages in the
-#      chunk before submitting the next one.
-#
-# Usage: brother-safe-print [--dry-run] file.pdf
+#!/usr/bin/env python3
+"""brother-safe-print - Memory-safe chunked printing for Brother DCP-1510.
 
-set -euo pipefail
+Renders the input PDF to CUPS raster via a SINGLE cupsfilter invocation
+(one Ghostscript process for all pages), then splits the raster at page
+boundaries, measures each page's compressed brlaser size by piping
+through rastertobrlaser (trivially fast — no rendering), packs pages
+into memory-safe chunks, and sends each chunk as raw brlaser data via
+`lp -o raw` — completely bypassing the CUPS filter chain for delivery.
 
-QUEUE="${QUEUE:-Brother_DCP-1510_series}"
-CHUNK_BYTES="${CHUNK_BYTES:-1000000}"  # ~1 MB of brlaser data per chunk (~DCP-1510 RAM)
-SECS_PER_PAGE="${SECS_PER_PAGE:-4}"    # settle delay per page after CUPS drain
-BASE_WAIT="${BASE_WAIT:-3}"            # fixed post-chunk pause
-PRIMARY_DPI="${PRIMARY_DPI:-600}"      # preferred render resolution
-FALLBACK_DPI="${FALLBACK_DPI:-300}"    # fallback used for pages too big at PRIMARY_DPI
-PPD="${PPD:-/etc/cups/ppd/${QUEUE}.ppd}"
-RASTERTOBRL="${RASTERTOBRL:-/usr/lib/cups/filter/rastertobrlaser}"
-DRY_RUN=0
+This means Ghostscript runs EXACTLY ONCE regardless of document size.
+A 1-page PDF has zero overhead vs plain `lp`. An 18-page PDF adds only
+the chunk-send time (~3 min of USB transfers + settle pauses).
+"""
 
-usage() {
-  cat >&2 <<EOF
-Usage: $0 [--dry-run] <file.pdf>
+import argparse
+import os
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import time
 
-Splits a PDF into the fewest possible chunks such that each chunk's brlaser
-output stays under CHUNK_BYTES, then sends the chunks sequentially to the
-CUPS queue "$QUEUE", waiting between chunks so the printer can finish each
-one before the next starts. Works around silent page drops on memory-poor
-Brother brlaser devices (notably DCP-1510 and family).
+QUEUE = os.environ.get("QUEUE", "Brother_DCP-1510_series")
+CHUNK_BYTES = int(os.environ.get("CHUNK_BYTES", "1000000"))
+SECS_PER_PAGE = int(os.environ.get("SECS_PER_PAGE", "4"))
+BASE_WAIT = int(os.environ.get("BASE_WAIT", "3"))
+PRIMARY_DPI = os.environ.get("PRIMARY_DPI", "600")
+FALLBACK_DPI = os.environ.get("FALLBACK_DPI", "300")
+PPD = os.environ.get("PPD", f"/etc/cups/ppd/{QUEUE}.ppd")
+RASTERTOBRL = os.environ.get("RASTERTOBRL", "/usr/lib/cups/filter/rastertobrlaser")
 
-Pages whose brlaser output alone exceeds CHUNK_BYTES at PRIMARY_DPI are
-re-rendered at FALLBACK_DPI. Pages still too big at FALLBACK_DPI cause the
-script to abort with an error (exit 5) — at that point the PDF needs to be
-simplified externally (e.g. \`gs -dPDFSETTINGS=/ebook\`) before printing.
-
-Environment overrides:
-  QUEUE           CUPS printer name              (default: Brother_DCP-1510_series)
-  CHUNK_BYTES     Max brlaser bytes per chunk    (default: 1000000 ~1 MB)
-  PRIMARY_DPI     Preferred render resolution    (default: 600)
-  FALLBACK_DPI    Fallback for oversize pages    (default: 300)
-  SECS_PER_PAGE   Settle seconds per page        (default: 4)
-  BASE_WAIT       Fixed post-chunk wait seconds  (default: 3)
-  PPD             Path to PPD                    (default: /etc/cups/ppd/<queue>.ppd)
-  RASTERTOBRL     Path to rastertobrlaser filter (default: /usr/lib/cups/filter/rastertobrlaser)
-
-Flags:
-  --dry-run       Measure and print the chunk plan, do not submit any job.
-
-Exit codes:
-  0  all chunks submitted (or dry-run completed)
-  1  usage / missing input
-  2  bad pdfinfo output
-  3  cupsfilter failure
-  4  rastertobrlaser failure
-  5  a page does not fit CHUNK_BYTES even at FALLBACK_DPI (irreducible)
-EOF
-  exit 1
+# CUPS raster magics:
+#   v1 BE "RaSt"  v1 LE "tSaR"
+#   v2 BE "RaS2"  v2 LE "2SaR"
+#   v3 BE "RaS3"  v3 LE "3SaR"
+_KNOWN_MAGICS = {
+    b"RaSt": ">", b"tSaR": "<",
+    b"RaS2": ">", b"2SaR": "<",
+    b"RaS3": ">", b"3SaR": "<",
 }
+_raster_magic = b"3SaR"
+_raster_endian = "<"
+RASTER_HDR_SIZE = 1796   # sizeof(cups_page_header2_t)
+# Offsets within cups_page_header2_t for cupsWidth/Height/BytesPerLine
+OFF_WIDTH = 372
+OFF_HEIGHT = 376
+OFF_BPL = 392
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --dry-run) DRY_RUN=1; shift ;;
-    -h|--help) usage ;;
-    --) shift; break ;;
-    -*) echo "unknown flag: $1" >&2; usage ;;
-    *) break ;;
-  esac
-done
 
-[[ $# -eq 1 ]] || usage
-SRC="$(readlink -f "$1")"
-[[ -r "$SRC" ]] || { echo "cannot read: $SRC" >&2; exit 1; }
-[[ -r "$PPD" ]] || { echo "cannot read PPD: $PPD" >&2; exit 1; }
-[[ -x "$RASTERTOBRL" ]] || { echo "missing filter: $RASTERTOBRL" >&2; exit 1; }
+def log(msg):
+    print(f"[brprint] {msg}", flush=True)
 
-for t in pdfinfo pdfseparate pdfunite cupsfilter lp lpstat stat awk; do
-  command -v "$t" >/dev/null || { echo "missing tool: $t" >&2; exit 1; }
-done
 
-WORK="$(mktemp -d -t brprint.XXXXXX)"
-trap 'rm -rf "$WORK"' EXIT
-cd "$WORK"
+def die(msg, code=1):
+    print(f"[brprint] ERROR: {msg}", file=sys.stderr, flush=True)
+    sys.exit(code)
 
-log() { printf '[brprint] %s\n' "$*"; }
 
-log "source:       $SRC"
-log "queue:        $QUEUE"
-log "ppd:          $PPD"
-log "budget:       $CHUNK_BYTES B brlaser per chunk"
-log "primary dpi:  $PRIMARY_DPI"
-log "fallback dpi: $FALLBACK_DPI"
-(( DRY_RUN )) && log "*** DRY RUN - will not actually print ***"
+# ── 1. Render PDF → CUPS raster (single Ghostscript invocation) ─────────
 
-NPAGES="$(pdfinfo "$SRC" | awk '/^Pages:/ {print $2; exit}')"
-[[ "$NPAGES" =~ ^[0-9]+$ && "$NPAGES" -gt 0 ]] || { echo "bad page count from pdfinfo" >&2; exit 2; }
-log "pages:        $NPAGES"
+def render_to_raster(pdf_path, ppd, dpi, out_path):
+    """Run cupsfilter once to produce a CUPS raster file for all pages."""
+    log(f"rendering all pages at {dpi}dpi via cupsfilter (single gs run)...")
+    try:
+        with open(out_path, "wb") as f:
+            subprocess.check_call(
+                ["cupsfilter", "-p", ppd,
+                 "-o", f"Resolution={dpi}dpi",
+                 "-m", "application/vnd.cups-raster",
+                 pdf_path],
+                stdout=f, stderr=subprocess.DEVNULL,
+            )
+    except subprocess.CalledProcessError as e:
+        die(f"cupsfilter failed (exit {e.returncode})", 3)
+    size = os.path.getsize(out_path)
+    if size < 4:
+        die("cupsfilter produced empty raster", 3)
+    log(f"raster: {size:,} bytes")
 
-pdfseparate "$SRC" 'p-%d.pdf'
 
-# Render one page at a given DPI through the full CUPS filter chain up to
-# rastertobrlaser and echo the resulting brlaser file size in bytes. Leaves
-# the intermediate files on disk so the caller can inspect them on failure.
-measure_page() {
-  local i="$1" dpi="$2"
-  local raster="p-$i.${dpi}.raster"
-  local brl="p-$i.${dpi}.brl"
-  local cferr="p-$i.${dpi}.cf.err"
-  local rblerr="p-$i.${dpi}.rbl.err"
-  cupsfilter -p "$PPD" -o "Resolution=${dpi}dpi" -m application/vnd.cups-raster "p-$i.pdf" \
-    > "$raster" 2> "$cferr" || return 3
-  PPD="$PPD" CUPS_SERVERROOT=/etc/cups \
-    "$RASTERTOBRL" 1 brprint "${SRC##*/}" 1 "Resolution=${dpi}dpi" "$raster" \
-      > "$brl" 2> "$rblerr" || return 4
-  rm -f "$raster"
-  stat -c '%s' "$brl"
-}
+# ── 2. Parse CUPS raster → per-page (offset, length) ────────────────────
 
-log "measuring brlaser byte cost per page (Ghostscript + rastertobrlaser per"
-log "  page — slow on a weak SBC; pages that don't fit at ${PRIMARY_DPI}dpi are"
-log "  remeasured at ${FALLBACK_DPI}dpi so this can add extra time)..."
+def parse_raster_pages(raster_path):
+    """Return list of (data_offset, header+data_length) for each page.
 
-declare -a SIZES DPIS
-total_brl=0
-downgraded=()
-for i in $(seq 1 "$NPAGES"); do
-  if ! s_primary=$(measure_page "$i" "$PRIMARY_DPI"); then
-    rc=$?
-    echo "[brprint] page $i: filter chain failed at ${PRIMARY_DPI}dpi" >&2
-    [[ -s "p-$i.${PRIMARY_DPI}.cf.err" ]]  && sed -n '1,15p' "p-$i.${PRIMARY_DPI}.cf.err"  >&2
-    [[ -s "p-$i.${PRIMARY_DPI}.rbl.err" ]] && sed -n '1,15p' "p-$i.${PRIMARY_DPI}.rbl.err" >&2
-    exit "$rc"
-  fi
-  if (( s_primary <= CHUNK_BYTES )); then
-    SIZES[$i]=$s_primary
-    DPIS[$i]=$PRIMARY_DPI
-    printf '[brprint]   page %2d: %9d B @ %sdpi\n' "$i" "$s_primary" "$PRIMARY_DPI"
-  else
-    # Page too big at primary DPI — try fallback
-    if ! s_fallback=$(measure_page "$i" "$FALLBACK_DPI"); then
-      rc=$?
-      echo "[brprint] page $i: filter chain failed at ${FALLBACK_DPI}dpi" >&2
-      [[ -s "p-$i.${FALLBACK_DPI}.cf.err" ]]  && sed -n '1,15p' "p-$i.${FALLBACK_DPI}.cf.err"  >&2
-      [[ -s "p-$i.${FALLBACK_DPI}.rbl.err" ]] && sed -n '1,15p' "p-$i.${FALLBACK_DPI}.rbl.err" >&2
-      exit "$rc"
-    fi
-    if (( s_fallback > CHUNK_BYTES )); then
-      log "ERROR: page $i does not fit in CHUNK_BYTES=$CHUNK_BYTES even at ${FALLBACK_DPI}dpi:"
-      log "  @ ${PRIMARY_DPI}dpi : $s_primary B"
-      log "  @ ${FALLBACK_DPI}dpi: $s_fallback B"
-      log "  This page is irreducible within the current budget. Options:"
-      log "    - raise CHUNK_BYTES (current: $CHUNK_BYTES) if you trust the printer with more,"
-      log "    - pre-simplify the PDF externally, e.g.:"
-      log "        gs -sDEVICE=pdfwrite -dPDFSETTINGS=/ebook -dNOPAUSE -dBATCH -dQUIET \\"
-      log "           -sOutputFile=simplified.pdf \"$SRC\""
-      log "    - or lower FALLBACK_DPI further if your PPD supports it (check \`lpoptions -l\`)."
-      exit 5
-    fi
-    SIZES[$i]=$s_fallback
-    DPIS[$i]=$FALLBACK_DPI
-    downgraded+=("$i")
-    printf '[brprint]   page %2d: %9d B @ %sdpi > %d budget → downgraded to %9d B @ %sdpi\n' \
-      "$i" "$s_primary" "$PRIMARY_DPI" "$CHUNK_BYTES" "$s_fallback" "$FALLBACK_DPI"
-  fi
-  total_brl=$((total_brl + SIZES[$i]))
-done
+    data_offset is the byte position of the page header within the file.
+    header+data_length = RASTER_HDR_SIZE + cupsHeight * cupsBytesPerLine.
+    """
+    size = os.path.getsize(raster_path)
+    pages = []
+    global _raster_magic, _raster_endian
+    with open(raster_path, "rb") as f:
+        magic = f.read(4)
+        if magic not in _KNOWN_MAGICS:
+            die(f"bad raster magic: {magic!r} (known: {sorted(_KNOWN_MAGICS)!r})")
+        _raster_magic = magic
+        _raster_endian = _KNOWN_MAGICS[magic]
+        pos = 4
+        while pos + RASTER_HDR_SIZE <= size:
+            f.seek(pos)
+            hdr = f.read(RASTER_HDR_SIZE)
+            if len(hdr) < RASTER_HDR_SIZE:
+                break
+            cw = struct.unpack_from(_raster_endian+"I", hdr, OFF_WIDTH)[0]
+            ch = struct.unpack_from(_raster_endian+"I", hdr, OFF_HEIGHT)[0]
+            bpl = struct.unpack_from(_raster_endian+"I", hdr, OFF_BPL)[0]
+            if cw == 0 or ch == 0 or bpl == 0:
+                break
+            page_data_len = ch * bpl
+            page_total = RASTER_HDR_SIZE + page_data_len
+            pages.append((pos, page_total))
+            pos += page_total
+    return pages
 
-# Drop the large intermediates — keep per-page PDFs for the assembly step.
-rm -f p-*.brl p-*.cf.err p-*.rbl.err p-*.raster
 
-log "total:        $total_brl B brlaser for $NPAGES pages (avg $((total_brl / NPAGES)) B/page)"
-if (( ${#downgraded[@]} > 0 )); then
-  log "downgraded:   ${#downgraded[@]} page(s) remeasured at ${FALLBACK_DPI}dpi: ${downgraded[*]}"
-fi
+# ── 3. Measure brlaser byte cost per page (fast, no Ghostscript) ────────
 
-# Greedy chunk packing — chunks must have homogeneous DPI, because lp applies
-# the -o Resolution option to the whole job.
-declare -a first last chunk_dpis
-first=(1)
-last=()
-chunk_dpis=("${DPIS[1]}")
-cur=${SIZES[1]}
+def extract_page_raster(raster_path, page_offset, page_length, out_path):
+    """Write a valid single-page CUPS raster file."""
+    with open(raster_path, "rb") as fin, open(out_path, "wb") as fout:
+        fout.write(_raster_magic)
+        fin.seek(page_offset)
+        remaining = page_length
+        while remaining > 0:
+            chunk = fin.read(min(remaining, 65536))
+            if not chunk:
+                break
+            fout.write(chunk)
+            remaining -= len(chunk)
 
-for i in $(seq 2 "$NPAGES"); do
-  s=${SIZES[$i]}
-  page_dpi=${DPIS[$i]}
-  prev_dpi=${chunk_dpis[$((${#chunk_dpis[@]}-1))]}
-  if (( cur + s > CHUNK_BYTES )) || [[ "$page_dpi" != "$prev_dpi" ]]; then
-    last+=($((i-1)))
-    first+=("$i")
-    chunk_dpis+=("$page_dpi")
-    cur=$s
-  else
-    cur=$((cur + s))
-  fi
-done
-last+=("$NPAGES")
 
-N=${#first[@]}
-log "plan:         $N chunks"
-for i in $(seq 0 $((N-1))); do
-  a=${first[$i]}; b=${last[$i]}
-  d=${chunk_dpis[$i]}
-  sum=0
-  for j in $(seq "$a" "$b"); do sum=$((sum + SIZES[$j])); done
-  printf '[brprint]   chunk %2d: pages %2d..%-2d  %9d B  (%d pp @ %sdpi)\n' \
-    "$((i+1))" "$a" "$b" "$sum" "$((b-a+1))" "$d"
-done
+def measure_brlaser(page_raster_path):
+    """Pipe a single-page raster through rastertobrlaser → return byte count."""
+    env = dict(os.environ, PPD=PPD, CUPS_SERVERROOT="/etc/cups")
+    try:
+        result = subprocess.run(
+            [RASTERTOBRL, "1", "brprint", "measure", "1", "",
+             page_raster_path],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            env=env, check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        die(f"rastertobrlaser failed (exit {e.returncode})", 4)
+    return len(result.stdout)
 
-if (( DRY_RUN )); then
-  log "dry run complete — not submitting any jobs"
-  exit 0
-fi
 
-wait_cups_drained() {
-  local t=0
-  while lpstat -W not-completed -o "$QUEUE" 2>/dev/null | grep -q .; do
-    sleep 1
-    t=$((t+1))
-    if (( t > 600 )); then
-      echo "[brprint] drain timeout (>600s) on queue $QUEUE" >&2
-      return 1
-    fi
-  done
-  return 0
-}
+def measure_all_pages(raster_path, pages):
+    """Measure brlaser byte cost of each page. Returns list of sizes."""
+    sizes = []
+    for i, (offset, length) in enumerate(pages, 1):
+        page_raster = os.path.join(work, f"p-{i}.raster")
+        extract_page_raster(raster_path, offset, length, page_raster)
+        s = measure_brlaser(page_raster)
+        os.remove(page_raster)
+        sizes.append(s)
+        log(f"  page {i:2d}: {s:9,} B brlaser")
+    return sizes
 
-BASENAME="${SRC##*/}"
-BASENAME="${BASENAME%.pdf}"
 
-for i in $(seq 0 $((N-1))); do
-  a=${first[$i]}; b=${last[$i]}
-  d=${chunk_dpis[$i]}
-  out="chunk-$((i+1))-p${a}-${b}-${d}dpi.pdf"
-  if [[ "$a" == "$b" ]]; then
-    cp "p-$a.pdf" "$out"
-  else
-    files=()
-    for j in $(seq "$a" "$b"); do files+=("p-$j.pdf"); done
-    pdfunite "${files[@]}" "$out"
-  fi
-  npp=$((b - a + 1))
-  title="${BASENAME} pp${a}-${b} @${d}dpi"
-  log "chunk $((i+1))/$N: submitting pages $a..$b at ${d}dpi as '$title'"
-  lp -d "$QUEUE" -t "$title" -o "Resolution=${d}dpi" "$out" >/dev/null
-  log "  waiting for CUPS queue to drain..."
-  wait_cups_drained || true
-  settle=$((npp * SECS_PER_PAGE + BASE_WAIT))
-  log "  mechanical settle: ${settle}s (${npp}pp × ${SECS_PER_PAGE}s + ${BASE_WAIT}s)"
-  sleep "$settle"
-done
+# ── 4. Greedy chunk packing ─────────────────────────────────────────────
 
-log "done: $N chunks sent to $QUEUE"
+def pack_chunks(sizes, budget):
+    """Return list of (start_idx, end_idx) 0-based inclusive ranges."""
+    if not sizes:
+        return []
+    chunks = []
+    start = 0
+    cur = sizes[0]
+    for i in range(1, len(sizes)):
+        if cur + sizes[i] > budget:
+            chunks.append((start, i - 1))
+            start = i
+            cur = sizes[i]
+        else:
+            cur += sizes[i]
+    chunks.append((start, len(sizes) - 1))
+    return chunks
+
+
+# ── 5. Build chunk raster and encode to brlaser ─────────────────────────
+
+def build_chunk_raster(raster_path, pages, page_indices, out_path):
+    """Build a CUPS raster containing only the selected pages."""
+    with open(out_path, "wb") as fout:
+        fout.write(_raster_magic)
+        for idx in page_indices:
+            offset, length = pages[idx]
+            with open(raster_path, "rb") as fin:
+                fin.seek(offset)
+                remaining = length
+                while remaining > 0:
+                    chunk = fin.read(min(remaining, 65536))
+                    if not chunk:
+                        break
+                    fout.write(chunk)
+                    remaining -= len(chunk)
+
+
+def raster_to_brlaser(raster_path, brlaser_path):
+    """Pipe a multi-page raster through rastertobrlaser."""
+    env = dict(os.environ, PPD=PPD, CUPS_SERVERROOT="/etc/cups")
+    with open(brlaser_path, "wb") as fout:
+        subprocess.check_call(
+            [RASTERTOBRL, "1", "brprint", "chunk", "1", "", raster_path],
+            stdout=fout, stderr=subprocess.DEVNULL, env=env,
+        )
+
+
+# ── 6. Send raw brlaser to printer ──────────────────────────────────────
+
+def send_raw(brlaser_path, title):
+    """Submit pre-rendered brlaser data via lp -o raw (no CUPS filters)."""
+    subprocess.check_call(
+        ["lp", "-d", QUEUE, "-o", "raw", "-t", title, brlaser_path],
+        stdout=subprocess.DEVNULL,
+    )
+
+
+def wait_drain(timeout=600):
+    """Wait until the CUPS queue has no active/pending jobs."""
+    for _ in range(timeout):
+        result = subprocess.run(
+            ["lpstat", "-W", "not-completed", "-o", QUEUE],
+            capture_output=True, text=True,
+        )
+        if not result.stdout.strip():
+            return True
+        time.sleep(1)
+    log(f"drain timeout (>{timeout}s)")
+    return False
+
+
+# ── Main ─────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Memory-safe chunked printing for Brother DCP-1510")
+    parser.add_argument("pdf", help="PDF file to print")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="measure and plan, don't print")
+    args = parser.parse_args()
+
+    src = os.path.realpath(args.pdf)
+    if not os.path.isfile(src):
+        die(f"not a file: {src}")
+    if not os.path.isfile(PPD):
+        die(f"cannot read PPD: {PPD}")
+    if not os.access(RASTERTOBRL, os.X_OK):
+        die(f"missing filter: {RASTERTOBRL}")
+
+    # Get page count
+    try:
+        info = subprocess.check_output(["pdfinfo", src],
+                                       stderr=subprocess.DEVNULL).decode()
+        npages = int([l for l in info.splitlines()
+                      if l.startswith("Pages:")][0].split(":")[1])
+    except Exception:
+        die("pdfinfo failed or returned no page count", 2)
+
+    log(f"source:       {src}")
+    log(f"queue:        {QUEUE}")
+    log(f"budget:       {CHUNK_BYTES:,} B per chunk")
+    log(f"pages:        {npages}")
+    if args.dry_run:
+        log("*** DRY RUN ***")
+
+    global work
+    work = tempfile.mkdtemp(prefix="brprint.")
+    try:
+        _run(src, npages, args.dry_run)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _run(src, npages, dry_run):
+    raster_path = os.path.join(work, "full.raster")
+
+    # ── Render once ──────────────────────────────────────────────────
+    dpi = PRIMARY_DPI
+    render_to_raster(src, PPD, dpi, raster_path)
+    pages = parse_raster_pages(raster_path)
+    if len(pages) != npages:
+        log(f"warning: pdfinfo says {npages} pages but raster has {len(pages)}")
+        npages = len(pages)
+    if npages == 0:
+        die("no pages in raster", 2)
+
+    # ── Measure each page's brlaser cost (rastertobrlaser only, fast) ─
+    log(f"measuring brlaser size per page (rastertobrlaser only, no gs)...")
+    sizes = measure_all_pages(raster_path, pages)
+    total = sum(sizes)
+    log(f"total:        {total:,} B brlaser for {npages} pages "
+        f"(avg {total // npages:,} B/page)")
+
+    # ── DPI fallback: if ANY page exceeds budget, re-render at lower DPI
+    oversize = [i for i, s in enumerate(sizes) if s > CHUNK_BYTES]
+    if oversize and dpi != FALLBACK_DPI:
+        log(f"{len(oversize)} page(s) exceed budget at {dpi}dpi, "
+            f"re-rendering at {FALLBACK_DPI}dpi...")
+        dpi = FALLBACK_DPI
+        render_to_raster(src, PPD, dpi, raster_path)
+        pages = parse_raster_pages(raster_path)
+        npages = len(pages)
+        log(f"re-measuring at {dpi}dpi...")
+        sizes = measure_all_pages(raster_path, pages)
+        total = sum(sizes)
+        log(f"total:        {total:,} B at {dpi}dpi")
+        still_over = [i for i, s in enumerate(sizes) if s > CHUNK_BYTES]
+        if still_over:
+            for i in still_over:
+                log(f"  page {i+1}: {sizes[i]:,} B > budget {CHUNK_BYTES:,}")
+            die(f"page(s) exceed budget even at {dpi}dpi", 5)
+
+    # ── Pack chunks ──────────────────────────────────────────────────
+    chunks = pack_chunks(sizes, CHUNK_BYTES)
+    log(f"plan:         {len(chunks)} chunks at {dpi}dpi")
+    for ci, (a, b) in enumerate(chunks, 1):
+        chunk_sum = sum(sizes[a:b + 1])
+        log(f"  chunk {ci:2d}: pages {a+1:2d}..{b+1:<2d}"
+            f"  {chunk_sum:9,} B  ({b - a + 1} pp)")
+
+    if dry_run:
+        log("dry run complete")
+        return
+
+    # ── Send each chunk as raw brlaser ───────────────────────────────
+    basename = os.path.splitext(os.path.basename(src))[0]
+    for ci, (a, b) in enumerate(chunks, 1):
+        npp = b - a + 1
+        title = f"{basename} pp{a+1}-{b+1} @{dpi}dpi"
+        log(f"chunk {ci}/{len(chunks)}: pages {a+1}..{b+1} as '{title}'")
+
+        chunk_raster = os.path.join(work, f"chunk-{ci}.raster")
+        chunk_brl = os.path.join(work, f"chunk-{ci}.brl")
+        build_chunk_raster(raster_path, pages, list(range(a, b + 1)),
+                           chunk_raster)
+        raster_to_brlaser(chunk_raster, chunk_brl)
+        os.remove(chunk_raster)
+
+        send_raw(chunk_brl, title)
+        os.remove(chunk_brl)
+
+        log("  waiting for CUPS queue to drain...")
+        wait_drain()
+        settle = npp * SECS_PER_PAGE + BASE_WAIT
+        log(f"  mechanical settle: {settle}s ({npp}pp x {SECS_PER_PAGE}s + {BASE_WAIT}s)")
+        time.sleep(settle)
+
+    log(f"done: {len(chunks)} chunks sent to {QUEUE}")
+
+
+if __name__ == "__main__":
+    main()
